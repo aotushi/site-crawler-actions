@@ -1,0 +1,9 @@
+{
+  "name": "site-crawler-actions",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "jszip": "3.10.1",
+    "playwright": "1.44.1"
+  }
+}
