@@ -158,6 +158,8 @@ async function main() {
       const zipPath = urlToZipPath(cleanUrl)
       zip.file(zipPath, html)
       console.log(`[page] ${cleanUrl} → ${zipPath}`)
+      const estimatedTotal = Math.min(pageQueue.length + visitedPages.size, MAX_PAGES)
+      console.log(`[PROGRESS] phase=crawl downloaded=${visitedPages.size} total=${estimatedTotal}`)
     } catch (e) {
       console.warn(`[warn] Failed to crawl ${cleanUrl}: ${e.message}`)
     } finally {
@@ -177,7 +179,9 @@ async function main() {
       const zipPath = urlToZipPath(assetUrl)
       zip.file(zipPath, data)
       assetCount++
-      if (assetCount % 20 === 0) console.log(`[assets] Downloaded ${assetCount}...`)
+      if (assetCount % 10 === 0) {
+        console.log(`[PROGRESS] phase=assets downloaded=${assetCount} total=${Math.min(assetUrls.size, MAX_ASSETS)}`)
+      }
     } catch (e) {
       console.warn(`[warn] Asset failed ${assetUrl}: ${e.message}`)
     }
