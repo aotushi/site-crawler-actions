@@ -20,7 +20,9 @@ jobs:
         run: npm ci
 
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        run: |
+          npx playwright install chromium
+          sudo apt-get install -y libasound2t64 libgbm1 libnss3 libxss1 libxtst6
 
       - name: Run crawl
         run: node scripts/crawl.js
