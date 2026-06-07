@@ -7,7 +7,7 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
@@ -15,14 +15,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('package-lock.json') }}
+
       - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: |
           npx playwright install chromium
           sudo apt-get install -y libasound2t64 libgbm1 libnss3 libxss1 libxtst6
+
+      - name: Install Playwright system deps (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: sudo apt-get install -y libasound2t64 libgbm1 libnss3 libxss1 libxtst6
 
       - name: Run crawl
         run: node scripts/crawl.js

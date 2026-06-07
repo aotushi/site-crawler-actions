@@ -19,8 +19,7 @@ if (!TARGET_URL) {
   process.exit(1)
 }
 
-const MAX_PAGES = 50
-const MAX_ASSETS = 300
+const MAX_ASSETS = parseInt(process.env.MAX_ASSETS || '0', 10) // 0 = unlimited
 const OUTPUT_DIR = path.join(process.cwd(), 'output')
 const OUTPUT_ZIP = path.join(OUTPUT_DIR, 'site.zip')
 
@@ -30,7 +29,7 @@ const STATIC_EXTS = new Set([
   '.mp4', '.webm', '.pdf', '.xml', '.txt',
 ])
 
-function urlToZipPath(urlStr) {
+function urlToZipPath(urlStr, origin) {
   try {
     const parsed = new URL(urlStr)
     let p = parsed.pathname.replace(/^\//, '') || 'index.html'
@@ -42,10 +41,63 @@ function urlToZipPath(urlStr) {
         p = p + '/index.html'
       }
     }
+    // 跨域资源放到 _external/<host>/ 下，避免与同源路径碰撞
+    if (origin && parsed.origin !== origin) {
+      p = `_external/${parsed.hostname}/${p}`
+    }
     return p
   } catch {
     return 'index.html'
   }
+}
+
+// 按 content-type 兜底判断是否为可保存的静态资源（覆盖无扩展名/动态 URL）
+function isAssetContentType(ct) {
+  if (!ct) return false
+  ct = ct.toLowerCase()
+  return ct.startsWith('image/') || ct.startsWith('video/') || ct.startsWith('audio/') ||
+    ct.startsWith('font/') || ct.includes('css') || ct.includes('javascript') ||
+    ct.includes('/json') || ct.includes('font') || ct.includes('octet-stream')
+}
+
+// 逐屏滚动到底，触发懒加载（Elementor 幻灯片、lazyload 图片等），再回到顶部
+async function autoScroll(page) {
+  try {
+    await page.evaluate(async () => {
+      const delay = (ms) => new Promise(r => setTimeout(r, ms))
+      let last = -1
+      for (let i = 0; i < 100; i++) {
+        window.scrollTo(0, document.body.scrollHeight)
+        await delay(350)
+        const h = document.body.scrollHeight
+        if (h === last) break
+        last = h
+      }
+      window.scrollTo(0, 0)
+    })
+    await page.waitForLoadState('networkidle', { timeout: 15000 })
+  } catch {
+    // 滚动/等待失败不影响主流程
+  }
+}
+
+// 将 HTML 中的绝对路径重写为相对路径，使本地打开时链接可用
+function rewriteAbsolutePaths(html, zipPath) {
+  const depth = zipPath.split('/').length - 1
+  const prefix = depth > 0 ? '../'.repeat(depth) : './'
+
+  return html
+    // href="/..." src="/..." action="/..."，跳过 // 协议相对 URL 和 # 锚点
+    .replace(/(href|src|action)="(\/(?!\/)([^"#]*))/g, (_, attr, _full, rest) => {
+      return `${attr}="${prefix}${rest}"`
+    })
+    // srcset 里的绝对路径
+    .replace(/srcset="([^"]*)"/g, (_, srcset) => {
+      const rewritten = srcset.replace(/(^|,\s*)(\/(?!\/)([^\s,]*))/g, (m, sep, _full, rest) => {
+        return `${sep}${prefix}${rest}`
+      })
+      return `srcset="${rewritten}"`
+    })
 }
 
 function fetchBinary(url) {
@@ -80,6 +132,7 @@ async function main() {
   const origin = new URL(TARGET_URL).origin
   const visitedPages = new Set()
   const assetUrls = new Set()
+  const assetMap = new Map() // url(去 query) -> { buffer, zipPath }，response 直存（含跨域/懒加载）
   const pageQueue = [TARGET_URL]
   const zip = new JSZip()
 
@@ -92,15 +145,16 @@ async function main() {
   })
 
   // Phase 1: crawl pages with Playwright
-  while (pageQueue.length > 0 && visitedPages.size < MAX_PAGES) {
+  while (pageQueue.length > 0) {
     const url = pageQueue.shift()
     const cleanUrl = url.split('#')[0]
     if (visitedPages.has(cleanUrl)) continue
     visitedPages.add(cleanUrl)
 
     const page = await context.newPage()
+    const pending = [] // response.body() 的异步取回，page.close 前需 settle
     try {
-      // Intercept requests to collect asset URLs
+      // Intercept requests to collect asset URLs（同源兜底用）
       page.on('request', req => {
         const reqUrl = req.url().split('?')[0].split('#')[0]
         if (!reqUrl.startsWith(origin)) return
@@ -110,7 +164,35 @@ async function main() {
         }
       })
 
+      // 直接保存浏览器实际拿到的响应体（含 JS 注入/懒加载/跨域资源）
+      page.on('response', resp => {
+        pending.push((async () => {
+          try {
+            const req = resp.request()
+            if (req.method() !== 'GET') return
+            if (req.resourceType() === 'document') return // 页面 HTML 由 page.content() 处理
+            const status = resp.status()
+            if (status < 200 || status >= 300) return
+            const noQuery = resp.url().split('#')[0].split('?')[0]
+            if (assetMap.has(noQuery)) return
+            const ct = resp.headers()['content-type'] || ''
+            const ext = path.extname(new URL(noQuery).pathname).toLowerCase()
+            if (!STATIC_EXTS.has(ext) && !isAssetContentType(ct)) return
+            const buffer = await resp.body()
+            if (buffer && buffer.length) {
+              assetMap.set(noQuery, { buffer, zipPath: urlToZipPath(noQuery, origin) })
+            }
+          } catch {
+            // 单个响应取回失败忽略
+          }
+        })())
+      })
+
       await page.goto(cleanUrl, { waitUntil: 'networkidle', timeout: 30000 })
+      // Nuxt/Vue SSR 首次加载时 hydration 可能未完成，reload 一次确保内容渲染
+      await page.reload({ waitUntil: 'networkidle', timeout: 30000 })
+      // 滚动触发懒加载资源（Elementor 背景幻灯片等）
+      await autoScroll(page)
 
       // Collect same-origin links
       const links = await page.evaluate((origin) => {
@@ -153,13 +235,15 @@ async function main() {
         assetUrls.add(u.split('?')[0].split('#')[0])
       }
 
-      // Save rendered HTML
-      const html = await page.content()
-      const zipPath = urlToZipPath(cleanUrl)
+      // Save rendered HTML（绝对路径重写为相对路径，本地打开可用）
+      const zipPath = urlToZipPath(cleanUrl, origin)
+      const html = rewriteAbsolutePaths(await page.content(), zipPath)
       zip.file(zipPath, html)
       console.log(`[page] ${cleanUrl} → ${zipPath}`)
-      const estimatedTotal = Math.min(pageQueue.length + visitedPages.size, MAX_PAGES)
+      const estimatedTotal = pageQueue.length + visitedPages.size
       console.log(`[PROGRESS] phase=crawl downloaded=${visitedPages.size} total=${estimatedTotal}`)
+      // 等待本页所有 response.body() 取回，再关闭页面
+      await Promise.allSettled(pending)
     } catch (e) {
       console.warn(`[warn] Failed to crawl ${cleanUrl}: ${e.message}`)
     } finally {
@@ -168,19 +252,29 @@ async function main() {
   }
 
   await browser.close()
-  console.log(`Pages crawled: ${visitedPages.size}, Assets to download: ${assetUrls.size}`)
+  console.log(`Pages crawled: ${visitedPages.size}, Captured(response): ${assetMap.size}, DOM/request urls: ${assetUrls.size}`)
 
-  // Phase 2: download static assets
+  // Phase 2a: 写入浏览器已直接拿到的响应体（含跨域/懒加载，无需重新下载）
   let assetCount = 0
+  const totalEstimate = assetMap.size + assetUrls.size
+  for (const [, { buffer, zipPath }] of assetMap) {
+    zip.file(zipPath, buffer)
+    assetCount++
+  }
+  console.log(`[PROGRESS] phase=assets downloaded=${assetCount} total=${totalEstimate}`)
+
+  // Phase 2b: 兜底下载 DOM/request 收集到但响应未捕获的同源资源
   for (const assetUrl of assetUrls) {
-    if (assetCount >= MAX_ASSETS) break
+    if (MAX_ASSETS > 0 && assetCount >= MAX_ASSETS) break
+    const noQuery = assetUrl.split('?')[0]
+    if (assetMap.has(noQuery)) continue
     try {
       const data = await fetchBinary(assetUrl)
-      const zipPath = urlToZipPath(assetUrl)
+      const zipPath = urlToZipPath(assetUrl, origin)
       zip.file(zipPath, data)
       assetCount++
       if (assetCount % 10 === 0) {
-        console.log(`[PROGRESS] phase=assets downloaded=${assetCount} total=${Math.min(assetUrls.size, MAX_ASSETS)}`)
+        console.log(`[PROGRESS] phase=assets downloaded=${assetCount} total=${totalEstimate}`)
       }
     } catch (e) {
       console.warn(`[warn] Asset failed ${assetUrl}: ${e.message}`)
