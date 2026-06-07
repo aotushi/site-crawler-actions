@@ -60,6 +60,24 @@ function isAssetContentType(ct) {
     ct.includes('/json') || ct.includes('font') || ct.includes('octet-stream')
 }
 
+// 反爬质询页特征（Imperva/Incapsula "One moment, please..." 等）
+function isChallengeTitle(title) {
+  return /one moment|just a moment|attention required|please wait|checking your browser|access denied/i.test(title || '')
+}
+
+// 检测到质询页则等待并多次 reload，让浏览器执行 JS 并带上质询 cookie 直至放行
+async function passChallenge(page) {
+  for (let i = 0; i < 5; i++) {
+    const title = await page.title().catch(() => '')
+    if (!isChallengeTitle(title)) return true
+    console.log(`[challenge] "${title}" → 等待重试 ${i + 1}/5`)
+    await page.waitForTimeout(6000)
+    try { await page.reload({ waitUntil: 'networkidle', timeout: 30000 }) } catch {}
+  }
+  const finalTitle = await page.title().catch(() => '')
+  return !isChallengeTitle(finalTitle)
+}
+
 // 逐屏滚动到底，触发懒加载（Elementor 幻灯片、lazyload 图片等），再回到顶部
 async function autoScroll(page) {
   try {
@@ -189,6 +207,12 @@ async function main() {
       })
 
       await page.goto(cleanUrl, { waitUntil: 'networkidle', timeout: 30000 })
+      // 反爬质询页（"One moment, please..." 等）：等待并多次 reload 直至放行
+      const passed = await passChallenge(page)
+      if (!passed) {
+        console.warn(`[warn] 质询未通过，跳过 ${cleanUrl}`)
+        continue
+      }
       // Nuxt/Vue SSR 首次加载时 hydration 可能未完成，reload 一次确保内容渲染
       await page.reload({ waitUntil: 'networkidle', timeout: 30000 })
       // 滚动触发懒加载资源（Elementor 背景幻灯片等）
